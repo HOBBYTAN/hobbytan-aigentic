@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import type { CSSProperties, FormEvent } from "react";
+import type { CSSProperties, FormEvent, ReactNode } from "react";
 import {
   onAuthStateChanged,
   signInWithPopup,
@@ -9,9 +9,13 @@ import type { User } from "firebase/auth";
 import {
   addDoc,
   collection,
+  doc,
+  getDoc,
   onSnapshot,
   orderBy,
   query,
+  runTransaction,
+  setDoc,
   serverTimestamp,
 } from "firebase/firestore";
 import { getBlob, getDownloadURL, ref, uploadBytes } from "firebase/storage";
@@ -180,6 +184,21 @@ type PreviewState = {
   error: string;
 };
 
+type DetailModalState = {
+  open: boolean;
+  title: string;
+  subtitle: string;
+  body: string;
+  markdown: boolean;
+  attachments: FileAsset[];
+};
+
+type UsageQuota = {
+  usedReports: number;
+  limit: number;
+  exhausted: boolean;
+};
+
 const PROVIDER_LABEL: Record<LlmProvider, string> = {
   openai: "OpenAI",
   anthropic: "Anthropic",
@@ -198,6 +217,9 @@ const LOCAL_KEY_RIGHT_PANEL_OPEN = "hobbytan.right_panel_open";
 const LOCAL_KEY_AMBIENT_MOTION = "hobbytan.ambient_motion";
 
 const DEFAULT_CHAT_RECIPIENTS = ["ATTENDANT-TAN", "PM-TAN", "DEV-TAN", "UX-TAN"];
+const FREE_REPORT_LIMIT = 3;
+const SUPPORT_EMAIL = "pablo@hobbytan.com";
+const AUTONOMOUS_EXECUTION_ROUNDS = 1;
 
 const UX_IMAGE_MODEL = "gemini-3-pro-image-preview";
 const DEPLOYED_APP_URL = "https://automagent-8d64c.web.app";
@@ -205,6 +227,18 @@ const DEPLOYED_APP_URL = "https://automagent-8d64c.web.app";
 const makeId = () => `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
 
 const sleep = (delay: number) => new Promise((resolve) => setTimeout(resolve, delay));
+
+const withTimeout = async <T,>(promise: Promise<T>, timeoutMs = 15000) =>
+  new Promise<T>((resolve, reject) => {
+    const timer = window.setTimeout(() => {
+      reject(new Error("요청 시간이 초과되었습니다."));
+    }, timeoutMs);
+
+    promise
+      .then((value) => resolve(value))
+      .catch((error) => reject(error))
+      .finally(() => window.clearTimeout(timer));
+  });
 
 const isDevMockEnabled = () =>
   import.meta.env.DEV &&
@@ -236,6 +270,19 @@ const isTextLikeMime = (mimeType: string) => {
   );
 };
 
+const isMarkdownMime = (mimeType: string, fileName?: string) => {
+  const normalized = mimeType.toLowerCase();
+  if (
+    normalized.includes("markdown") ||
+    normalized === "text/x-markdown" ||
+    normalized === "text/md"
+  ) {
+    return true;
+  }
+
+  return !!fileName && fileName.toLowerCase().endsWith(".md");
+};
+
 const extensionFromMime = (mimeType: string) => {
   if (mimeType.includes("png")) return "png";
   if (mimeType.includes("jpeg") || mimeType.includes("jpg")) return "jpg";
@@ -243,6 +290,113 @@ const extensionFromMime = (mimeType: string) => {
   if (mimeType.includes("gif")) return "gif";
   if (mimeType.includes("pdf")) return "pdf";
   return "bin";
+};
+
+const toConversationPlainText = (raw: string) =>
+  raw
+    .replace(/```([\s\S]*?)```/g, "$1")
+    .replace(/^#{1,6}\s+/gm, "")
+    .replace(/\*\*(.*?)\*\*/g, "$1")
+    .replace(/\*(.*?)\*/g, "$1")
+    .replace(/`([^`]+)`/g, "$1")
+    .replace(/^\s*[-*]\s+/gm, "• ")
+    .replace(/^\s*\d+\.\s+/gm, "• ")
+    .trim();
+
+const shortenText = (raw: string, maxLength = 240) => {
+  const plain = toConversationPlainText(raw);
+  if (plain.length <= maxLength) {
+    return plain;
+  }
+  return `${plain.slice(0, maxLength).trim()}...`;
+};
+
+const stripInlineMarkdown = (text: string) =>
+  text
+    .replace(/`([^`]+)`/g, "$1")
+    .replace(/\*\*(.*?)\*\*/g, "$1")
+    .replace(/\*(.*?)\*/g, "$1")
+    .replace(/~~(.*?)~~/g, "$1");
+
+const renderMarkdownBlocks = (raw: string): ReactNode[] => {
+  const lines = raw.replace(/\r/g, "").split("\n");
+  const blocks: ReactNode[] = [];
+  let listBuffer: string[] = [];
+  let orderedList = false;
+  let keyIndex = 0;
+
+  const flushList = () => {
+    if (listBuffer.length === 0) {
+      return;
+    }
+
+    const items = listBuffer.map((item, itemIndex) => (
+      <li key={`li-${keyIndex}-${itemIndex}`}>{stripInlineMarkdown(item)}</li>
+    ));
+    blocks.push(
+      orderedList ? (
+        <ol key={`ol-${keyIndex}`}>{items}</ol>
+      ) : (
+        <ul key={`ul-${keyIndex}`}>{items}</ul>
+      ),
+    );
+
+    keyIndex += 1;
+    listBuffer = [];
+    orderedList = false;
+  };
+
+  for (const line of lines) {
+    const heading = line.match(/^(#{1,4})\s+(.*)$/);
+    if (heading) {
+      flushList();
+      const depth = heading[1].length;
+      const text = stripInlineMarkdown(heading[2].trim());
+      if (depth === 1) {
+        blocks.push(<h1 key={`h1-${keyIndex}`}>{text}</h1>);
+      } else if (depth === 2) {
+        blocks.push(<h2 key={`h2-${keyIndex}`}>{text}</h2>);
+      } else if (depth === 3) {
+        blocks.push(<h3 key={`h3-${keyIndex}`}>{text}</h3>);
+      } else {
+        blocks.push(<h4 key={`h4-${keyIndex}`}>{text}</h4>);
+      }
+      keyIndex += 1;
+      continue;
+    }
+
+    const unordered = line.match(/^\s*[-*]\s+(.*)$/);
+    if (unordered) {
+      if (listBuffer.length === 0) {
+        orderedList = false;
+      }
+      listBuffer.push(unordered[1]);
+      continue;
+    }
+
+    const ordered = line.match(/^\s*\d+\.\s+(.*)$/);
+    if (ordered) {
+      if (listBuffer.length === 0) {
+        orderedList = true;
+      }
+      listBuffer.push(ordered[1]);
+      continue;
+    }
+
+    if (!line.trim()) {
+      flushList();
+      blocks.push(<br key={`br-${keyIndex}`} />);
+      keyIndex += 1;
+      continue;
+    }
+
+    flushList();
+    blocks.push(<p key={`p-${keyIndex}`}>{stripInlineMarkdown(line)}</p>);
+    keyIndex += 1;
+  }
+
+  flushList();
+  return blocks;
 };
 
 const base64ToBlob = (base64Data: string, mimeType: string) => {
@@ -537,6 +691,19 @@ function App() {
     textContent: "",
     error: "",
   });
+  const [detailModal, setDetailModal] = useState<DetailModalState>({
+    open: false,
+    title: "",
+    subtitle: "",
+    body: "",
+    markdown: false,
+    attachments: [],
+  });
+  const [usageQuota, setUsageQuota] = useState<UsageQuota>({
+    usedReports: 0,
+    limit: FREE_REPORT_LIMIT,
+    exhausted: false,
+  });
   const governancePollingRef = useRef(false);
   const governanceLastRunRef = useRef(0);
   const governanceSignatureRef = useRef("");
@@ -716,6 +883,70 @@ function App() {
     } catch {
       return "";
     }
+  }, [devMockEnabled, user]);
+
+  const refreshUsageQuota = useCallback(async (targetUser: User) => {
+    const usageRef = doc(db, "users", targetUser.uid, "meta", "usage");
+    const snapshot = await getDoc(usageRef);
+
+    if (!snapshot.exists()) {
+      await setDoc(usageRef, {
+        usedReports: 0,
+        limit: FREE_REPORT_LIMIT,
+        updatedAt: serverTimestamp(),
+      });
+      setUsageQuota({
+        usedReports: 0,
+        limit: FREE_REPORT_LIMIT,
+        exhausted: false,
+      });
+      return;
+    }
+
+    const data = snapshot.data() as Record<string, unknown>;
+    const usedReports = Math.max(0, Number(data.usedReports || 0));
+    const limit = Math.max(1, Number(data.limit || FREE_REPORT_LIMIT));
+
+    setUsageQuota({
+      usedReports,
+      limit,
+      exhausted: usedReports >= limit,
+    });
+  }, []);
+
+  const consumeReportQuota = useCallback(async () => {
+    if (!user || devMockEnabled) {
+      return;
+    }
+
+    const usageRef = doc(db, "users", user.uid, "meta", "usage");
+
+    const nextQuota = await runTransaction(db, async (transaction) => {
+      const snapshot = await transaction.get(usageRef);
+      const currentData = snapshot.data() as Record<string, unknown> | undefined;
+      const currentUsed = Math.max(0, Number(currentData?.usedReports || 0));
+      const limit = Math.max(1, Number(currentData?.limit || FREE_REPORT_LIMIT));
+      const nextUsed = Math.min(currentUsed + 1, limit);
+
+      transaction.set(
+        usageRef,
+        {
+          usedReports: nextUsed,
+          limit,
+          lastUsedAt: serverTimestamp(),
+          updatedAt: serverTimestamp(),
+        },
+        { merge: true },
+      );
+
+      return { usedReports: nextUsed, limit };
+    });
+
+    setUsageQuota({
+      usedReports: nextQuota.usedReports,
+      limit: nextQuota.limit,
+      exhausted: nextQuota.usedReports >= nextQuota.limit,
+    });
   }, [devMockEnabled, user]);
 
   const createThread = () => {
@@ -1003,7 +1234,6 @@ function App() {
         "\n반환 형식:",
         '{"strategy":"문장","participants":["PO-TAN"],"handoff":"문장"}',
       ].join("\n"),
-      temperature: 0.35,
       maxOutputTokens: 700,
     });
 
@@ -1068,7 +1298,6 @@ function App() {
         "형식: 담당자별 항목을 포함한 간결한 실행 지시문",
       ].join("\n\n"),
       maxOutputTokens: 700,
-      temperature: 0.35,
     });
 
     const pmPlan = await requestLlmText({
@@ -1086,7 +1315,6 @@ function App() {
         "역할: 담당자별 일정/WBS, 의존성, 완료 조건, 리스크 완화 순서를 명시하라.",
       ].join("\n\n"),
       maxOutputTokens: 700,
-      temperature: 0.35,
     });
 
     return { poPlan, pmPlan };
@@ -1136,8 +1364,8 @@ function App() {
               "이전 발언 기록(먼저 말한 에이전트의 발언을 반드시 반영할 것):",
               priorDialogue || "아직 발언 없음",
               "당신 차례: 앞선 발언을 이어받아 액션 2개 + 리스크/대응 1개 + 다음 담당자에게 넘길 한 줄을 제시하라.",
+              "중요: 회의 대화록이므로 마크다운 기호(#,*,``` 등)를 과도하게 쓰지 말고 일반 문장으로 작성하라.",
             ].join("\n\n"),
-            temperature: 0.45,
             maxOutputTokens: 700,
             useWebSearch: memberId === "RESEARCHER-TAN",
           });
@@ -1186,11 +1414,159 @@ function App() {
     };
   };
 
+  const runAutonomousExecutionLoop = async (
+    task: string,
+    strategy: string,
+    participants: string[],
+    managementContext: string,
+  ) => {
+    const rounds = Math.max(0, AUTONOMOUS_EXECUTION_ROUNDS);
+    if (rounds === 0 || participants.length === 0) {
+      return {
+        notes: [] as CollaborationNote[],
+        digest: "",
+      };
+    }
+
+    const generatedNotes: CollaborationNote[] = [];
+    const digestBlocks: string[] = [];
+    let rollingContext = managementContext;
+
+    for (let round = 1; round <= rounds; round += 1) {
+      appendLog("execution", `자기개선 라운드 ${round} 시작 (병렬 실행)`);
+
+      const parallelResults = await Promise.all(
+        participants.map(async (memberId) => {
+          const member = getMember(memberId);
+          if (!member) {
+            return null;
+          }
+
+          try {
+            const reply = await runOfficerSingleReply(
+              memberId,
+              [
+                `[자기개선 라운드 ${round}]`,
+                `CEO 지시: ${task}`,
+                `기준 전략: ${strategy}`,
+                "당신 담당 액션플랜을 실제 실행한다고 가정하고, 실행 로그/산출물/다음 단계/차단 이슈를 상세히 작성하라.",
+                "중요: 마크다운 기호를 과도하게 사용하지 말고 일반 텍스트 위주로 작성하라.",
+              ].join("\n"),
+              [],
+              "CEO-HOBBY",
+              rollingContext,
+            );
+
+            return { memberId, reply };
+          } catch (error) {
+            const message =
+              error instanceof Error ? error.message : "병렬 실행 응답 실패";
+            return {
+              memberId,
+              reply: `응답 실패: ${message}`,
+            };
+          }
+        }),
+      );
+
+      const normalized = parallelResults.filter(
+        (item): item is { memberId: string; reply: string } => !!item,
+      );
+
+      normalized.forEach((item) => {
+        generatedNotes.push({
+          memberId: item.memberId,
+          note: item.reply,
+        });
+        appendMeetingTurn({
+          sessionId: `autonomous-${round}-${Date.now()}`,
+          room: "collaboration",
+          speakerId: item.memberId,
+          speakerName: getMember(item.memberId)?.displayName || item.memberId,
+          text: `[자기개선 라운드 ${round}] ${item.reply}`,
+          source: "workflow",
+        });
+        upsertActionPlan(item.memberId, item.reply, "workflow", activeThreadId);
+      });
+
+      const roundTranscript = normalized
+        .map((item) => `${item.memberId}: ${item.reply}`)
+        .join("\n\n");
+
+      const hostSummary = await runOfficerSingleReply(
+        "HOST-TAN",
+        `자기개선 라운드 ${round}의 병렬 실행 결과를 운영 관점에서 정리하고 다음 액션을 지시하라.`,
+        [],
+        "CEO-HOBBY",
+        roundTranscript,
+      );
+      const poSummary = await runOfficerSingleReply(
+        "PO-TAN",
+        `자기개선 라운드 ${round} 결과를 우선순위/가치 기준으로 재정렬해 다음 액션을 지시하라.`,
+        [],
+        "CEO-HOBBY",
+        roundTranscript,
+      );
+      const pmSummary = await runOfficerSingleReply(
+        "PM-TAN",
+        `자기개선 라운드 ${round} 결과를 일정/의존성/WBS 관점에서 재정렬해 다음 액션을 지시하라.`,
+        [],
+        "CEO-HOBBY",
+        roundTranscript,
+      );
+      const attendantSummary = await runOfficerSingleReply(
+        "ATTENDANT-TAN",
+        `자기개선 라운드 ${round} 결과를 통합하여 다음 실행 순서를 결정하라.`,
+        [],
+        "CEO-HOBBY",
+        [roundTranscript, hostSummary, poSummary, pmSummary].join("\n\n"),
+      );
+
+      const synthesis = [
+        `HOST-TAN: ${hostSummary}`,
+        `PO-TAN: ${poSummary}`,
+        `PM-TAN: ${pmSummary}`,
+        `ATTENDANT-TAN: ${attendantSummary}`,
+      ].join("\n\n");
+
+      appendMeetingTurn({
+        sessionId: `autonomous-summary-${round}-${Date.now()}`,
+        room: "collaboration",
+        speakerId: "ATTENDANT-TAN",
+        speakerName: "ATTENDANT-TAN",
+        text: `[라운드 ${round} 통합 요약]\n${synthesis}`,
+        source: "workflow",
+      });
+
+      digestBlocks.push(
+        [
+          `## 자기개선 라운드 ${round}`,
+          "",
+          "### 병렬 실행 로그",
+          roundTranscript || "- 없음",
+          "",
+          "### 운영 통합 요약",
+          synthesis,
+        ].join("\n"),
+      );
+
+      rollingContext = [rollingContext, roundTranscript, synthesis].join("\n\n");
+      appendLog("execution", `자기개선 라운드 ${round} 완료`);
+      await runGovernanceWatch(`자기개선 라운드 ${round} 점검\n${rollingContext}`);
+    }
+
+    return {
+      notes: generatedNotes,
+      digest: digestBlocks.join("\n\n"),
+    };
+  };
+
   const runFinalReport = async (
     task: string,
     strategy: string,
     notes: CollaborationNote[],
     detailedActionPlans: ActionPlanItem[],
+    improvementDigest: string,
   ) => {
     const runtime = resolveRuntime("ATTENDANT-TAN");
     const authToken = await getProxyAuthToken();
@@ -1203,6 +1579,7 @@ function App() {
           `${index + 1}. ${plan.memberId} (${plan.memberName})\n${plan.plan}`,
       )
       .join("\n\n");
+    const improvementBlock = improvementDigest.trim() || "자기개선 라운드 로그 없음";
 
     if (!authToken) {
       return [
@@ -1214,16 +1591,19 @@ function App() {
         "",
         "TAN별 액션플랜:",
         joinedPlans || "- 없음",
+        "",
+        "자기개선 라운드:",
+        improvementBlock,
       ].join("\n");
     }
 
-    return requestLlmText({
+    let reportText = await requestLlmText({
       provider: runtime.provider,
       model: runtime.model,
       baseUrl: runtime.baseUrl,
       authToken,
       instructions:
-        "당신은 ATTENDANT-TAN이다. 대표에게 올리는 상세 경영 실행보고서를 작성한다. 절대 요약형으로 끝내지 말고, 실제 실행/개발/배포까지 이어질 수준으로 상세하게 작성한다.",
+        "당신은 ATTENDANT-TAN이다. 대표에게 올리는 상세 경영 실행보고서를 작성한다. 절대 요약형으로 끝내지 말고, 실제 실행/개발/배포까지 이어질 수준으로 상세하게 작성한다. 문서 길이는 충분히 길고(최소 2,500자 이상) 실무지시가 바로 가능한 수준이어야 한다.",
       input: [
         `CEO 지시: ${task}`,
         `브레인스토밍 전략: ${strategy}`,
@@ -1231,18 +1611,43 @@ function App() {
         joinedNotes,
         "TAN별 액션플랜:",
         joinedPlans || "없음",
+        "자기개선 라운드 로그:",
+        improvementBlock,
         "응답 형식:",
-        "1) 경영 요약(2~3문단)",
-        "2) TAN별 상세 액션플랜(담당/산출물/완료조건/예상소요/선행의존성)",
-        "3) 개발 실행안(기능 구현 범위, 테스트 계획, 품질 게이트)",
-        "4) 배포 실행안(환경/체크리스트/롤백/모니터링)",
-        "5) 리스크/법무/HR 감시 포인트",
-        "6) CEO 승인 필요 항목",
-        "7) 승인 직후 다음 플로우(오늘/내일/이번주 액션)",
+        "1) 경영 요약(3~5문단, 숫자 근거 포함)",
+        "2) TAN별 상세 액션플랜(담당/산출물/완료조건/예상소요/선행의존성/대체경로)",
+        "3) 병렬 실행 로그 요약(누가 무엇을 병렬 수행했는지)",
+        "4) 개발 실행안(기능 구현 범위, 테스트 계획, 품질 게이트, 코드/배포 연계)",
+        "5) 배포 실행안(환경/체크리스트/롤백/모니터링/알림 규칙)",
+        "6) 리스크/법무/HR 감시 포인트",
+        "7) CEO 승인 필요 항목",
+        "8) 승인 직후 다음 플로우(오늘/내일/이번주 액션 + 책임자)",
       ].join("\n\n"),
-      temperature: 0.3,
       maxOutputTokens: 2400,
     });
+
+    if (reportText.length < 2000) {
+      reportText = await requestLlmText({
+        provider: runtime.provider,
+        model: runtime.model,
+        baseUrl: runtime.baseUrl,
+        authToken,
+        instructions:
+          "당신은 ATTENDANT-TAN이다. 아래 초안 보고서를 2배 이상 상세화하라. 누락된 실행 단계를 채우고 실제 개발/배포/검증 흐름으로 확장하라.",
+        input: [
+          "초안 보고서:",
+          reportText,
+          "",
+          "확장 지시:",
+          "- 길이: 최소 2,500자",
+          "- TAN별 액션플랜은 담당/완료조건/다음 단계 포함",
+          "- 마지막에 CEO 승인 체크리스트를 명확히 제시",
+        ].join("\n"),
+        maxOutputTokens: 3000,
+      });
+    }
+
+    return reportText;
   };
 
   const runOfficerSingleReply = useCallback(async (
@@ -1292,8 +1697,8 @@ function App() {
         `이전 대화 요약: ${priorDialogue || "없음"}`,
         devSyncInstruction,
         "형식: 핵심 요약 1문단 + 액션 3개 + 리스크/대응 1개 + 보고 문장 1개",
+        "중요: 대화용 답변이므로 마크다운 문법(#,*,``` 등)을 과도하게 사용하지 말고 일반 문장/번호 텍스트로 작성하라.",
       ].join("\n\n"),
-      temperature: 0.4,
       maxOutputTokens: 750,
       useWebSearch: memberId === "RESEARCHER-TAN",
     });
@@ -1432,6 +1837,14 @@ function App() {
     }
 
     const trimmedTask = task.trim();
+
+    if (!devMockEnabled && usageQuota.exhausted) {
+      setWorkflowError(
+        `무료 보고서 ${usageQuota.limit}회를 모두 사용했습니다. 추가 이용은 ${SUPPORT_EMAIL} 로 문의해 주세요.`,
+      );
+      return;
+    }
+
     setWorkflowError("");
     setRunning(true);
     updateThread(activeThreadId, {
@@ -1538,7 +1951,7 @@ function App() {
         collaborationMembers,
         managementContext,
       );
-      const notes = collaborationSession.notes;
+      let notes = collaborationSession.notes;
       notes.forEach((item) => {
         upsertActionPlan(item.memberId, item.note, "workflow", activeThreadId);
       });
@@ -1546,6 +1959,20 @@ function App() {
         "collaboration",
         `회의 로그 기록 완료: 세션 ${collaborationSession.sessionId}, 발언 ${collaborationSession.transcript.length}건`,
       );
+
+      const autonomousResult = await runAutonomousExecutionLoop(
+        trimmedTask,
+        brainstorm.strategy,
+        collaborationMembers,
+        [
+          managementContext,
+          ...collaborationSession.notes.map((item) => `${item.memberId}: ${item.note}`),
+        ].join("\n\n"),
+      );
+
+      if (autonomousResult.notes.length > 0) {
+        notes = [...notes, ...autonomousResult.notes];
+      }
 
       setPhase("execution");
       setMembersToDesk(collaborationMembers, true, () => "개별 산출물 작성 중");
@@ -1608,6 +2035,7 @@ function App() {
         brainstorm.strategy,
         notes,
         reportPlans,
+        autonomousResult.digest,
       );
 
       let reportDocumentAsset: FileAsset | undefined;
@@ -1669,6 +2097,11 @@ function App() {
       };
 
       await persistReport(reportData);
+      await consumeReportQuota().catch((error) => {
+        const message =
+          error instanceof Error ? error.message : "사용량 반영 실패";
+        appendLog("reporting", `무료 사용량 반영 실패(보고는 완료): ${message}`);
+      });
 
       await persistOfficeMessage({
         threadId: activeThreadId,
@@ -1960,7 +2393,6 @@ function App() {
               "실행 결과는 1) 지금 수행한 일 2) 산출물 3) 다음 실행 단계 4) 차단 이슈로 보고하라.",
             ].join("\n\n"),
             maxOutputTokens: 900,
-            temperature: 0.35,
           })
         : await runOfficerSingleReply(
             plan.memberId,
@@ -2122,41 +2554,39 @@ function App() {
   }, []);
 
   const fetchAssetBlob = useCallback(async (asset: FileAsset) => {
-    try {
-      const response = await fetchWithTimeout(asset.url);
-      if (!response.ok) {
-        throw new Error(`HTTP ${response.status}`);
-      }
-      return await response.blob();
-    } catch (primaryError) {
-      if (asset.path && user) {
-        const storageRef = ref(storage, asset.path);
-        try {
-          return await getBlob(storageRef);
-        } catch {
-          const refreshedUrl = await getDownloadURL(storageRef);
-          const refreshedResponse = await fetchWithTimeout(refreshedUrl);
-          if (!refreshedResponse.ok) {
-            throw new Error(`HTTP ${refreshedResponse.status}`);
-          }
-          return await refreshedResponse.blob();
+    if (asset.path && user) {
+      const storageRef = ref(storage, asset.path);
+      try {
+        return await getBlob(storageRef);
+      } catch {
+        const refreshedUrl = await getDownloadURL(storageRef);
+        const refreshedResponse = await fetchWithTimeout(refreshedUrl);
+        if (!refreshedResponse.ok) {
+          throw new Error(`HTTP ${refreshedResponse.status}`);
         }
+        return await refreshedResponse.blob();
       }
-      throw primaryError;
     }
+
+    const response = await fetchWithTimeout(asset.url);
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}`);
+    }
+    return await response.blob();
   }, [fetchWithTimeout, user]);
 
   const handleDownloadAsset = useCallback(async (asset: FileAsset) => {
     try {
-      const rawBlob = await fetchAssetBlob(asset);
+      const rawBlob = await withTimeout(fetchAssetBlob(asset), 18000);
       let downloadBlob = rawBlob;
 
       if (isTextLikeMime(asset.mimeType)) {
         const decoded = new TextDecoder("utf-8").decode(await rawBlob.arrayBuffer());
+        const normalizedText = decoded.replace(/^\uFEFF/, "");
         const normalizedMimeType = asset.mimeType.toLowerCase().includes("charset=")
           ? asset.mimeType
           : `${asset.mimeType}; charset=utf-8`;
-        downloadBlob = new Blob([`\uFEFF${decoded}`], { type: normalizedMimeType });
+        downloadBlob = new Blob([`\uFEFF${normalizedText}`], { type: normalizedMimeType });
       }
 
       const objectUrl = URL.createObjectURL(downloadBlob);
@@ -2185,11 +2615,11 @@ function App() {
     });
 
     try {
-      const blob = await fetchAssetBlob(asset);
+      const blob = await withTimeout(fetchAssetBlob(asset), 18000);
 
       if (isTextLikeMime(asset.mimeType)) {
         const bytes = await blob.arrayBuffer();
-        const text = new TextDecoder("utf-8").decode(bytes);
+        const text = new TextDecoder("utf-8").decode(bytes).replace(/^\uFEFF/, "");
         setPreview({
           open: true,
           asset,
@@ -2243,6 +2673,34 @@ function App() {
     });
   };
 
+  const openDetailModal = (
+    title: string,
+    subtitle: string,
+    body: string,
+    markdown: boolean,
+    attachments: FileAsset[] = [],
+  ) => {
+    setDetailModal({
+      open: true,
+      title,
+      subtitle,
+      body,
+      markdown,
+      attachments,
+    });
+  };
+
+  const closeDetailModal = () => {
+    setDetailModal({
+      open: false,
+      title: "",
+      subtitle: "",
+      body: "",
+      markdown: false,
+      attachments: [],
+    });
+  };
+
   const executeWorkflow = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     await startWorkflow(taskInput);
@@ -2268,6 +2726,25 @@ function App() {
 
     return () => unsubscribe();
   }, [devMockEnabled]);
+
+  useEffect(() => {
+    if (!user || devMockEnabled) {
+      setUsageQuota({
+        usedReports: 0,
+        limit: FREE_REPORT_LIMIT,
+        exhausted: false,
+      });
+      return;
+    }
+
+    void refreshUsageQuota(user).catch(() => {
+      setUsageQuota({
+        usedReports: 0,
+        limit: FREE_REPORT_LIMIT,
+        exhausted: false,
+      });
+    });
+  }, [devMockEnabled, refreshUsageQuota, user]);
 
   useEffect(() => {
     const timer = setInterval(() => {
@@ -2799,6 +3276,19 @@ function App() {
                 <p className="dimmed">
                   입력 UI는 탭으로 분리되어 있으며, 실행 기록은 현재 스레드에 저장됩니다.
                 </p>
+                <div className={`quota-banner ${usageQuota.exhausted ? "exhausted" : ""}`}>
+                  <strong>
+                    무료 보고서 사용량: {Math.min(usageQuota.usedReports, usageQuota.limit)} /{" "}
+                    {usageQuota.limit}
+                  </strong>
+                  {usageQuota.exhausted ? (
+                    <span>
+                      무료 사용이 종료되었습니다. 추가 이용은 {SUPPORT_EMAIL} 로 문의해 주세요.
+                    </span>
+                  ) : (
+                    <span>현재 스레드에서 보고서 생성 시 1회 차감됩니다.</span>
+                  )}
+                </div>
 
                 <label htmlFor="task-input">대표 지시</label>
                 <textarea
@@ -3229,6 +3719,15 @@ function App() {
                     <article
                       key={message.id}
                       className={`chat-message ${mine ? "mine" : ""}`}
+                      onClick={() =>
+                        openDetailModal(
+                          `${message.senderName} 메시지`,
+                          `${formatTime(message.createdAt)} · ${message.senderRole}`,
+                          message.text,
+                          false,
+                          message.attachments,
+                        )
+                      }
                     >
                       <img src={avatar} alt={message.senderName} referrerPolicy="no-referrer" />
                       <div className="chat-bubble">
@@ -3242,7 +3741,7 @@ function App() {
                             ? ` · 대상: ${message.targetIds.join(", ")}`
                             : ""}
                         </small>
-                        <p>{message.text}</p>
+                        <p>{toConversationPlainText(message.text)}</p>
 
                         {message.attachments.length > 0 && (
                           <div className="attachment-list">
@@ -3257,7 +3756,8 @@ function App() {
                                 <div className="attachment-actions">
                                   <button
                                     type="button"
-                                    onClick={() => {
+                                    onClick={(event) => {
+                                      event.stopPropagation();
                                       void openAttachmentPreview(asset);
                                     }}
                                   >
@@ -3265,7 +3765,8 @@ function App() {
                                   </button>
                                   <button
                                     type="button"
-                                    onClick={() => {
+                                    onClick={(event) => {
+                                      event.stopPropagation();
                                       void handleDownloadAsset(asset);
                                     }}
                                   >
@@ -3324,27 +3825,55 @@ function App() {
           {rightTab === "meeting" && (
             <div className="side-block">
               <h2>회의 로그</h2>
+              {visibleActionPlans.length > 0 && (
+                <div className="meeting-plan-summary">
+                  <strong>액션플랜 스냅샷</strong>
+                  <ul>
+                    {visibleActionPlans.slice(0, 6).map((plan) => (
+                      <li key={plan.id}>
+                        {plan.memberId}: {shortenText(plan.plan, 90)}
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              )}
               <div className="meeting-list">
                 {visibleMeetingTurns.length === 0 && (
                   <p className="dimmed">회의 로그가 아직 없습니다.</p>
                 )}
 
-                {visibleMeetingTurns.map((turn) => (
-                  <article key={turn.id} className="meeting-item">
-                    <header>
-                      <strong>
-                        {turn.room === "brainstorming"
-                          ? "브레인스토밍"
-                          : "협업"}
-                      </strong>
-                      <span>{formatTime(turn.createdAt)}</span>
-                    </header>
-                    <small>
-                      {turn.speakerName} ({turn.speakerId})
-                    </small>
-                    <p>{turn.text}</p>
-                  </article>
-                ))}
+                {visibleMeetingTurns.map((turn) => {
+                  const avatar = avatarForMember(turn.speakerId, user);
+                  const roomLabel =
+                    turn.room === "brainstorming" ? "브레인스토밍" : "협업";
+
+                  return (
+                    <article
+                      key={turn.id}
+                      className="meeting-item meeting-dialog-item"
+                      onClick={() =>
+                        openDetailModal(
+                          `${turn.speakerName} 회의 발언`,
+                          `${formatTime(turn.createdAt)} · ${roomLabel} · ${turn.speakerId}`,
+                          turn.text,
+                          false,
+                        )
+                      }
+                    >
+                      <img src={avatar} alt={turn.speakerName} referrerPolicy="no-referrer" />
+                      <div className="meeting-bubble">
+                        <header>
+                          <strong>{turn.speakerName}</strong>
+                          <span>{formatTime(turn.createdAt)}</span>
+                        </header>
+                        <small>
+                          {turn.speakerId} · {roomLabel}
+                        </small>
+                        <p>{toConversationPlainText(turn.text)}</p>
+                      </div>
+                    </article>
+                  );
+                })}
               </div>
             </div>
           )}
@@ -3357,7 +3886,18 @@ function App() {
                   <p className="dimmed">아직 생성된 액션플랜이 없습니다.</p>
                 )}
                 {visibleActionPlans.map((plan) => (
-                  <article key={plan.id} className="meeting-item">
+                  <article
+                    key={plan.id}
+                    className="meeting-item"
+                    onClick={() =>
+                      openDetailModal(
+                        `${plan.memberName} 액션플랜`,
+                        `${plan.memberId} · ${formatTime(plan.updatedAt)}`,
+                        plan.plan,
+                        false,
+                      )
+                    }
+                  >
                     <header>
                       <strong>{plan.memberName}</strong>
                       <span>{formatTime(plan.updatedAt)}</span>
@@ -3366,18 +3906,19 @@ function App() {
                       {plan.memberId} · {plan.source}
                       {plan.lastExecutedAt ? ` · 실행: ${formatTime(plan.lastExecutedAt)}` : ""}
                     </small>
-                    <p>{plan.plan}</p>
+                    <p>{toConversationPlainText(plan.plan)}</p>
                     {plan.lastExecutionSummary && (
                       <p>
                         <strong>최근 실행 요약:</strong>{" "}
-                        {plan.lastExecutionSummary}
+                        {toConversationPlainText(plan.lastExecutionSummary)}
                       </p>
                     )}
                     <button
                       type="button"
                       className="primary-button"
                       disabled={executingPlanId === plan.id}
-                      onClick={() => {
+                      onClick={(event) => {
+                        event.stopPropagation();
                         void executeActionPlan(plan);
                       }}
                     >
@@ -3398,12 +3939,24 @@ function App() {
                 )}
 
                 {visibleReports.map((report) => (
-                  <article key={report.id} className="report-item">
+                  <article
+                    key={report.id}
+                    className="report-item"
+                    onClick={() =>
+                      openDetailModal(
+                        report.title,
+                        `${formatTime(report.createdAt)} · 참여 ${report.participants.length}명`,
+                        report.body,
+                        true,
+                        report.assets,
+                      )
+                    }
+                  >
                     <header>
                       <strong>{report.title}</strong>
                       <span>{formatTime(report.createdAt)}</span>
                     </header>
-                    <p>{report.body}</p>
+                    <p>{shortenText(report.body, 260)}</p>
 
                     {report.participants.length > 0 && (
                       <div className="participants">참여: {report.participants.join(", ")}</div>
@@ -3420,7 +3973,8 @@ function App() {
                             <div className="attachment-actions">
                               <button
                                 type="button"
-                                onClick={() => {
+                                onClick={(event) => {
+                                  event.stopPropagation();
                                   void openAttachmentPreview(asset);
                                 }}
                               >
@@ -3428,7 +3982,8 @@ function App() {
                               </button>
                               <button
                                 type="button"
-                                onClick={() => {
+                                onClick={(event) => {
+                                  event.stopPropagation();
                                   void handleDownloadAsset(asset);
                                 }}
                               >
@@ -3458,12 +4013,23 @@ function App() {
                 )}
 
                 {visibleActivityLogs.map((log) => (
-                  <article key={log.id} className="log-item">
+                  <article
+                    key={log.id}
+                    className="log-item"
+                    onClick={() =>
+                      openDetailModal(
+                        `실시간 로그 · ${log.phase}`,
+                        formatTime(log.createdAt),
+                        log.message,
+                        false,
+                      )
+                    }
+                  >
                     <header>
                       <strong>{log.phase}</strong>
                       <span>{formatTime(log.createdAt)}</span>
                     </header>
-                    <p>{log.message}</p>
+                    <p>{shortenText(log.message, 180)}</p>
                   </article>
                 ))}
               </div>
@@ -3478,14 +4044,25 @@ function App() {
                   <p className="dimmed">아직 감시 이벤트가 없습니다.</p>
                 )}
                 {visibleGovernanceAlerts.map((item) => (
-                  <article key={item.id} className="log-item">
+                  <article
+                    key={item.id}
+                    className="log-item"
+                    onClick={() =>
+                      openDetailModal(
+                        `${item.source} · ${item.status}`,
+                        formatTime(item.createdAt),
+                        item.message,
+                        false,
+                      )
+                    }
+                  >
                     <header>
                       <strong>
                         {item.source} · {item.status}
                       </strong>
                       <span>{formatTime(item.createdAt)}</span>
                     </header>
-                    <p>{item.message}</p>
+                    <p>{shortenText(item.message, 180)}</p>
                   </article>
                 ))}
               </div>
@@ -3494,6 +4071,70 @@ function App() {
           </section>
         )}
       </main>
+
+      {detailModal.open && (
+        <div
+          className="detail-overlay"
+          onClick={closeDetailModal}
+          role="presentation"
+        >
+          <div
+            className="detail-modal"
+            onClick={(event) => event.stopPropagation()}
+            role="presentation"
+          >
+            <header>
+              <div>
+                <strong>{detailModal.title}</strong>
+                <span>{detailModal.subtitle}</span>
+              </div>
+              <button type="button" onClick={closeDetailModal}>
+                닫기
+              </button>
+            </header>
+            <div className="detail-content">
+              {detailModal.markdown ? (
+                <div className="markdown-preview">
+                  {renderMarkdownBlocks(detailModal.body)}
+                </div>
+              ) : (
+                <pre>{detailModal.body}</pre>
+              )}
+
+              {detailModal.attachments.length > 0 && (
+                <div className="attachment-list">
+                  {detailModal.attachments.map((asset) => (
+                    <div key={asset.id} className="attachment-item">
+                      <div>
+                        <strong>{asset.name}</strong>
+                        <span>{asset.mimeType}</span>
+                      </div>
+                      <div className="attachment-actions">
+                        <button
+                          type="button"
+                          onClick={() => {
+                            void openAttachmentPreview(asset);
+                          }}
+                        >
+                          프리뷰
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            void handleDownloadAsset(asset);
+                          }}
+                        >
+                          다운로드
+                        </button>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
 
       {previewState.open && previewState.asset && (
         <div
@@ -3537,9 +4178,17 @@ function App() {
                   />
                 )}
 
-                {isTextLikeMime(previewState.asset.mimeType) && (
-                  <pre>{previewState.textContent}</pre>
-                )}
+                {isTextLikeMime(previewState.asset.mimeType) &&
+                  (isMarkdownMime(
+                    previewState.asset.mimeType,
+                    previewState.asset.name,
+                  ) ? (
+                    <div className="markdown-preview">
+                      {renderMarkdownBlocks(previewState.textContent)}
+                    </div>
+                  ) : (
+                    <pre>{previewState.textContent}</pre>
+                  ))}
 
                 {!previewState.asset.mimeType.startsWith("image/") &&
                   previewState.asset.mimeType !== "application/pdf" &&

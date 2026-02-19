@@ -417,6 +417,35 @@ button {
   flex-wrap: wrap;
 }
 
+.quota-banner {
+  border: 1px solid rgba(244, 211, 94, 0.3);
+  background: rgba(244, 211, 94, 0.08);
+  border-radius: 10px;
+  padding: 8px 10px;
+  display: grid;
+  gap: 4px;
+  margin: 4px 0 2px;
+}
+
+.quota-banner strong {
+  font-size: 0.78rem;
+  color: #ffe58f;
+}
+
+.quota-banner span {
+  font-size: 0.72rem;
+  color: var(--text-dim);
+}
+
+.quota-banner.exhausted {
+  border-color: rgba(255, 107, 107, 0.42);
+  background: rgba(255, 107, 107, 0.08);
+}
+
+.quota-banner.exhausted strong {
+  color: #ffb0b0;
+}
+
 .role-grid {
   margin-top: 9px;
   display: grid;
@@ -765,6 +794,7 @@ button {
   display: flex;
   gap: 8px;
   align-items: flex-start;
+  cursor: pointer;
 }
 
 .chat-message.mine {
@@ -839,6 +869,7 @@ button {
   border-radius: 10px;
   padding: 8px;
   background: rgba(0, 0, 0, 0.22);
+  cursor: pointer;
 }
 
 .log-item header,
@@ -873,6 +904,51 @@ button {
   font-size: 0.72rem;
   line-height: 1.4;
   white-space: pre-wrap;
+}
+
+.meeting-plan-summary {
+  border: 1px solid rgba(244, 211, 94, 0.28);
+  border-radius: 10px;
+  background: rgba(244, 211, 94, 0.05);
+  padding: 8px;
+  margin-bottom: 8px;
+}
+
+.meeting-plan-summary strong {
+  font-size: 0.76rem;
+  color: #ffe58f;
+}
+
+.meeting-plan-summary ul {
+  margin: 6px 0 0;
+  padding-left: 18px;
+  color: var(--text-dim);
+  font-size: 0.71rem;
+  display: grid;
+  gap: 4px;
+}
+
+.meeting-dialog-item {
+  display: flex;
+  gap: 8px;
+  align-items: flex-start;
+}
+
+.meeting-dialog-item img {
+  width: 32px;
+  height: 32px;
+  border-radius: 50%;
+  object-fit: cover;
+  border: 1px solid rgba(255, 255, 255, 0.25);
+}
+
+.meeting-bubble {
+  flex: 1;
+  min-width: 0;
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  border-radius: 10px;
+  padding: 8px;
+  background: rgba(255, 255, 255, 0.03);
 }
 
 .participants {
@@ -987,8 +1063,77 @@ button {
   backdrop-filter: blur(2px);
   display: grid;
   place-items: center;
-  z-index: 50;
+  z-index: 130;
   padding: 16px;
+}
+
+.detail-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.55);
+  backdrop-filter: blur(2px);
+  display: grid;
+  place-items: center;
+  z-index: 90;
+  padding: 16px;
+}
+
+.detail-modal {
+  width: min(1200px, 100%);
+  max-height: 90vh;
+  border-radius: 14px;
+  border: 1px solid rgba(255, 255, 255, 0.24);
+  background: rgba(5, 15, 24, 0.96);
+  overflow: hidden;
+  display: grid;
+  grid-template-rows: auto 1fr;
+}
+
+.detail-modal header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 12px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.14);
+}
+
+.detail-modal header strong {
+  display: block;
+  font-size: 0.92rem;
+}
+
+.detail-modal header span {
+  display: block;
+  margin-top: 2px;
+  font-size: 0.7rem;
+  color: var(--text-dim);
+}
+
+.detail-modal button {
+  background: rgba(255, 255, 255, 0.08);
+  color: var(--text-main);
+  border: 1px solid rgba(255, 255, 255, 0.22);
+  border-radius: 10px;
+  padding: 8px 10px;
+  cursor: pointer;
+}
+
+.detail-content {
+  min-height: 0;
+  overflow: auto;
+  padding: 12px;
+  display: grid;
+  gap: 12px;
+}
+
+.detail-content pre {
+  margin: 0;
+  white-space: pre-wrap;
+  line-height: 1.46;
+  font-size: 0.82rem;
+  font-family: "IBM Plex Mono", monospace;
+  color: #d9ecff;
 }
 
 .preview-modal {
@@ -1055,6 +1200,57 @@ button {
   font-size: 0.8rem;
   font-family: "IBM Plex Mono", monospace;
   color: #d9ecff;
+}
+
+.markdown-preview {
+  color: #d9ecff;
+  line-height: 1.6;
+  font-size: 0.88rem;
+}
+
+.markdown-preview h1,
+.markdown-preview h2,
+.markdown-preview h3,
+.markdown-preview h4 {
+  color: #f0f8ff;
+  margin: 12px 0 8px;
+}
+
+.markdown-preview p {
+  margin: 8px 0;
+  white-space: pre-wrap;
+}
+
+.markdown-preview ul,
+.markdown-preview ol {
+  margin: 8px 0;
+  padding-left: 20px;
+}
+
+.markdown-preview li {
+  margin: 4px 0;
+}
+
+.markdown-preview blockquote {
+  margin: 10px 0;
+  border-left: 3px solid rgba(25, 198, 229, 0.6);
+  padding: 4px 10px;
+  color: #bfe6ff;
+  background: rgba(25, 198, 229, 0.06);
+}
+
+.markdown-preview code {
+  background: rgba(255, 255, 255, 0.08);
+  padding: 1px 5px;
+  border-radius: 5px;
+  font-family: "IBM Plex Mono", monospace;
+  font-size: 0.83em;
+}
+
+.markdown-preview pre code {
+  display: block;
+  white-space: pre-wrap;
+  line-height: 1.45;
 }
 
 .unsupported-preview {
