@@ -4,7 +4,7 @@ import { getFirestore } from "firebase/firestore";
 import { getStorage } from "firebase/storage";
 
 const firebaseConfig = {
-  apiKey: import.meta.env.VITE_FIREBASE_API_KEY || "AIzaSyDOwXsDG1QnUoY3IgIhx22Gl_Mwk37ddnE",
+  apiKey: import.meta.env.VITE_FIREBASE_API_KEY || "REMOVED_GOOGLE_API_KEY",
   authDomain: import.meta.env.VITE_FIREBASE_AUTH_DOMAIN || "automagent-8d64c.firebaseapp.com",
   projectId: import.meta.env.VITE_FIREBASE_PROJECT_ID || "automagent-8d64c",
   storageBucket:
